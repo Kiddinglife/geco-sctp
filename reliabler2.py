@@ -132,10 +132,12 @@ class sctp_msg(object):
         self.data = None 
 
 class FakeTransport(object):
+    def __init__(self):
+        self.r = None
+        
     def write(self, packet, addr):
-        logging.debug("faked write\n")
-        p = deepcopy(packet)
-        logging.debug("typeof(packet) %s" % type(packet))
+        logging.debug("faked write packet {%d, %s}" %(len(packet), type(packet)))
+        self.r.recvr(packet)
         
 class Reliabler(object):
     def __init__(self, transport, addr):
@@ -224,6 +226,7 @@ class Reliabler(object):
         
     def handle_data_chunk(self, msg):
         debug_msg = bytearray()
+        msgdatlen = len(msg.data)
         
         # construct fragment's chunk  header 
         stream_itfier = msg.stream_identifier
@@ -266,7 +269,7 @@ class Reliabler(object):
                         self.sm_seq_nums[stream_itfier] = 0 
                     # finally send all sending packets
                     for packet in self.sending_packets:
-                        self.transport.write(packet, self.addr)
+                        self.transport.write(bytes(packet), self.addr)
                         # @TODO - we cannot  delete the packet until we recive the SACK from receiver
                         # at this moment, just simply clear the list
                         if len(packet) == MAX_PACKET_SIZE:
@@ -409,7 +412,6 @@ class Reliabler(object):
                         chunk_type | chunk_flag, chunk_len,
                         self.trans_seq_num, stream_itfier, self.sm_seq_nums[stream_itfier], payload_ptc_itf,
                         chunk_val)  
-                    logging.debug(type(packet_buf))
                     struct.pack_into((packet_formate) % max_data_chunk_payloads_size, packet_buf, 0, *values)
                     
                     if chunk_flag == CHUNK_FLAG_UB:
@@ -458,9 +460,9 @@ class Reliabler(object):
                         chunk_type | chunk_flag, chunk_len,
                         self.trans_seq_num, stream_itfier, self.sm_seq_nums[stream_itfier], payload_ptc_itf,
                         chunk_val)
-                    logging.debug(type(packet_buf))
                     struct.pack_into((packet_formate) % remaining , packet_buf, 0, *values)     
-                       
+                
+                    
                     if not msg.is_unorder_msg:
                         logging.debug("Last O Fragmented msg:\nchunk_action '%d,%s'\nchunk_type '%d, %s',\nchunk_flag '%d, %s',\nchunk_len '%d',\ntsn '%d',\nsi '%d',\
                         \nssn '%d' \ncombinations '%d, %s'" % (action2take, bin(action2take), chunk_type, bin(chunk_type), chunk_flag, bin(chunk_flag), chunk_len,
@@ -471,6 +473,12 @@ class Reliabler(object):
                         \ncombinations '%d, %s'" % (action2take, bin(action2take), chunk_type, bin(chunk_type), chunk_flag, bin(chunk_flag), chunk_len,
                         self.trans_seq_num, stream_itfier, chunk_type | chunk_flag, bin(chunk_type | chunk_flag))) 
                     debug_msg += packet_buf[MAX_PACKET_SIZE - max_data_chunk_payloads_size : MAX_PACKET_SIZE - max_data_chunk_payloads_size + remaining]
+#                     ver = unpack_from("!2I",packet_buf[:MAX_PACKET_SIZE - max_data_chunk_payloads_size + remaining], 0)[0]  
+#                     cs = unpack_from("!2I",packet_buf[:MAX_PACKET_SIZE - max_data_chunk_payloads_size + remaining], 0)[1]
+#                     ct = unpack_from("!BH",packet_buf[:MAX_PACKET_SIZE - max_data_chunk_payloads_size + remaining], 8)[0]
+#                     le = unpack_from("!BH",packet_buf[:MAX_PACKET_SIZE - max_data_chunk_payloads_size + remaining], 8)[1]
+#                     tsn = unpack_from("!I",packet_buf[:MAX_PACKET_SIZE - max_data_chunk_payloads_size + remaining], 11)[0]
+#                     logging.debug("v{%d}, cs{%d}, CT{%d},chunk_len{%d}, TSN{%d}" %(ver,cs,ct, le,tsn))
                     
                     if remaining > 0:
                         # at least there is one byte user data to carry, only header has no meaning we use uordered data size to get more chances to carry more data
@@ -478,6 +486,15 @@ class Reliabler(object):
                             logging.debug("unfull packet\n")
                             self.unfull_packet_buf = packet_buf        
                             self.unfull_packet_buf_remaining_space = max_data_chunk_payloads_size - remaining 
+                            # increament trans_seq_num when this msg fragments are all sent    
+                            self.trans_seq_num += 1
+                            if self.trans_seq_num > 0xffffffff:
+                                self.trans_seq_num = 0 
+                            # increament sm_seq_num when this msg fragments are all sent    
+                            self.sm_seq_nums[stream_itfier] += 1
+                            if self.sm_seq_nums[stream_itfier] > 0xffff:
+                                self.sm_seq_nums[stream_itfier] = 0 
+                            return
                 else:
                     # construct middle fragment's chunk value 
                     chunk_val = msg.data[curr_rd_offset + i * max_data_chunk_payloads_size : curr_rd_offset + (i + 1) * max_data_chunk_payloads_size]
@@ -624,7 +641,7 @@ class Reliabler(object):
             
         # finally send all sending packets
         for packet in self.sending_packets:
-            self.transport.write(packet, self.addr)
+            self.transport.write(bytes(packet), self.addr)
             # @TODO - we cannot  delete the packet until we recive the SACK from receiver
             # at this moment, just simply clear the list
             if len(packet) == MAX_PACKET_SIZE:
@@ -656,12 +673,20 @@ class Reliabler(object):
         ret = unpack_from(PACKET_HR_FORMATE, datagram, 0)
         verifi = ret[0]
         checksum = ret[1]
-        tsn = ret[2]
-        logging.debug("Read packet hdr values:\nverifier{%d}\nchecksum{%d}\ntsn{%d}" % (verifi, checksum, tsn))
+        logging.debug("verifier{%d}checksum{%d}" % (verifi, checksum))
         
         unread_bytes = chunks_total_bytes = len(datagram) - PACKET_HR_SIZE
         red_pos = PACKET_HR_SIZE
-        logging.debug("unread_bytes{%d}\nred_pos{%d}" % (unread_bytes, red_pos))
+        logging.debug("unread_bytes{%d} red_pos{%d}\n" % (unread_bytes, red_pos))
+        
+        chunk_type = None
+        chunk_flag = None
+        chunk_length = None
+        transmit_seq_num = None
+        stream_identifier = None
+        sm_seq_nums = None
+        payload_protocol_identifier = None
+        chunk_data = None
         
         # read all chunks contained in this packet
         while unread_bytes > 0: 
@@ -672,10 +697,24 @@ class Reliabler(object):
             chunk_length = ret[1]  # UINT16
             red_pos += CHUNK_COMM_HDR_SIZE
             unread_bytes -= CHUNK_COMM_HDR_SIZE
-            logging.debug("Read chunks comm hdr field values:\nchunk_type{%d}, chunk_flag{%d}, chunk len{%d}" % (chunk_type, chunk_flag, chunk_length))
+            logging.debug("chunk_type{%d}, chunk_flag{%d}, chunk len{%d}" % (chunk_type, chunk_flag, chunk_length))
+            logging.debug("unread_bytes{%d} red_pos{%d}\n" % (unread_bytes, red_pos))
             
+                            
+            if chunk_flag == CHUNK_FLAG_UBE:
+                str = "U unfragmented:\n"
+            elif chunk_flag == CHUNK_FLAG_UB:
+                str = "U first fragment:\n"
+            elif chunk_flag == CHUNK_FLAG_UE:
+                str = "U last fragment:\n"
+            elif chunk_flag == CHUNK_FLAG_OBE:
+                str = "O unfragmented:\n"
+            elif chunk_flag == CHUNK_FLAG_OB:
+                str = "O first fragment:\n"
+            elif chunk_flag == CHUNK_FLAG_OE:
+                str = "O last fragment:\n"
+                
             # read specific chunk header field values
-            logging.debug("Read specifiv chunk header fields values:\n")
             if chunk_type == CHUNK_TYPE_DATA:
                 unorder = True if chunk_flag & CHUNK_FLAG_UMASK == 0 else False
                 if unorder:
@@ -683,11 +722,12 @@ class Reliabler(object):
                     ret = unpack_from(formate, datagram, red_pos)
                     transmit_seq_num = ret[0]  # UINT32
                     stream_identifier = ret[1]  # UINT16
-                    payload_protocol_identifier = ret[3]  # UINT32
-                    red_pos += O_DATA_CHUNK_FULL_HR_SIZE
-                    unread_bytes -= CHUNK_COMM_HDR_SIZE
-                    logging.debug("U transmit_seq_num{%d}, stream_identifier{%d}, sm_seq_nums {%d},payload_protocol_identifier{%d}"
-                                  % (transmit_seq_num, stream_identifier, sm_seq_nums, payload_protocol_identifier))
+                    payload_protocol_identifier = ret[2]  # UINT32
+                    red_pos += U_DATA_CHUNK_COMM_HDR_SIZE - CHUNK_COMM_HDR_SIZE
+                    unread_bytes -=  U_DATA_CHUNK_COMM_HDR_SIZE - CHUNK_COMM_HDR_SIZE
+                    chunk_data_len = chunk_length-U_DATA_CHUNK_COMM_HDR_SIZE
+                    logging.debug(str+"transmit_seq_num{%d}, stream_identifier{%d},payload_protocol_identifier{%d}"
+                                  % (transmit_seq_num, stream_identifier,payload_protocol_identifier))
                 else:
                     formate = O_DATA_CHUNK_COMM_HDR_FORMATE
                     ret = unpack_from(formate, datagram, red_pos)
@@ -695,35 +735,22 @@ class Reliabler(object):
                     stream_identifier = ret[1]  # UINT16
                     sm_seq_nums = ret[2]  # UINT16
                     payload_protocol_identifier = ret[3]  # UINT32
-                    red_pos += O_DATA_CHUNK_FULL_HR_SIZE
-                    unread_bytes -= CHUNK_COMM_HDR_SIZE
-                    logging.debug("U transmit_seq_num{%d}, stream_identifier{%d}, sm_seq_nums {%d},payload_protocol_identifier{%d}"
+                    red_pos +=  O_DATA_CHUNK_COMM_HDR_SIZE - CHUNK_COMM_HDR_SIZE
+                    unread_bytes -= O_DATA_CHUNK_COMM_HDR_SIZE - CHUNK_COMM_HDR_SIZE
+                    chunk_data_len = chunk_length-O_DATA_CHUNK_COMM_HDR_SIZE
+                    logging.debug(str+"transmit_seq_num{%d}, stream_identifier{%d}, sm_seq_nums {%d},payload_protocol_identifier{%d}"
                                   % (transmit_seq_num, stream_identifier, sm_seq_nums, payload_protocol_identifier))
-                logging.debug("unread_bytes{%d}\nred_pos{%d}" % (unread_bytes, red_pos))
+                logging.debug("unread_bytes{%d} red_pos{%d}\n" % (unread_bytes, red_pos))
                 
-                if chunk_flag == CHUNK_FLAG_UBE:
-                    pass
-                
-                ret = unpack_from(formate, datagram, red_pos)
-                transmit_seq_num = ret[3]  # UINT32
-                stream_identifier = ret[4]  # UINT16
-                sm_seq_nums = ret[5]  # UINT16
-                payload_protocol_identifier = ret[6]  # UINT32
-                chunk_data = ret[7] 
-                logging.debug("Read chunks fields values: \
-                 \nchunl_len {%d} red_pos {%d}\
-                 \n chunk_type{%d}\nchunk_flag{%d}\nchunk_length{%d}\ntransmit_seq_num{%d}stream_identifier{%d}\
-                 sm_seq_nums{%d}\npayload_protocol_identifier{%d}\n" 
-                 % (chunk_length, red_pos,
-                      chunk_type, chunk_flag, chunk_length,
-                       transmit_seq_num, stream_identifier, sm_seq_nums,
-                        payload_protocol_identifier))
-                pass
+                chunk_data =  unpack_from("%ds"%chunk_data_len, datagram, red_pos)
+                red_pos += chunk_data_len
+                unread_bytes -= chunk_data_len
+                logging.debug("unread_bytes{%d} red_pos{%d}\n" % (unread_bytes, red_pos))
             elif chunk_type == CHUNK_TYPE_INIT:
                 pass
             elif chunk_type == CHUNK_TYPE_SACK:
                 pass
-            
+            return
             # store this chunk's tsn  for ack and congestion avoidance @TODOLATER
             self.received_tsns.append(transmit_seq_num)
             self.received_tsns.sort()
@@ -733,7 +760,6 @@ class Reliabler(object):
             # reassemble fragments if needed
             if chunk_flag == CHUNK_FLAG_UBE:
                 logging.debug("Unordered UnFragment")
-                
                 pass
             elif chunk_flag == CHUNK_FLAG_UB:
                 logging.debug("First Unordered Fragment")
@@ -757,85 +783,23 @@ class Reliabler(object):
                 logging.debug("Last Ordered Fragment")
                 pass
             
-            
-        #
-        if msg_group_index == 0:  # it is first fragment complete or incomplete
-            msg_fragments_size = struct.unpack_from("!H", datagram, 6)[0]
-            if msg_fragments_size <= 1:  # this msg is not fragmented and is complete msg
-                # simply return it to upper layer
-                msg_payload_len = struct.unpack_from("!H", datagram, 8)[0]
-                msg_chunk_data = struct.unpack_from("!%ds" % msg_payload_len, datagram, 10)[0]
-                self.complete_user_msgs.append(bytes(msg_chunk_data))
-                logging.debug("Receive a complete msg stop processing.\n")
-                return
-            else:  # this is the first frament, it must be a full packet
-                msg_payload_len = MAX_PACKET_SIZE - self.msg_group_field_size - self.msg_group_index_field_size
-                msg_chunk_data = struct.unpack_from("!%ds" % msg_payload_len, datagram, 8)[0]
-                # we extend it to hold all fragments
-                if msg_fragments_size > self.max_buffered_fragments_size:
-                     self.recvs[msg_group_id][self.fragments_index].extend([x for x in xrange(msg_fragments_size - self.max_buffered_fragments_size)])    
-                     self.max_buffered_fragments_size = msg_fragments_size
-                self.recvs[msg_group_id][self.total_fragments_size_index] = msg_fragments_size 
-                logging.debug("first fragment received, msg_group_index '%d', msg_chunk_size '%d' msg_fragment_size%d\n" 
-                      % (msg_group_index, msg_payload_len, msg_fragments_size))
-        elif msg_group_index == msg_fragments_size - 1:  # last fragment received
-            msg_payload_len = struct.unpack_from("!H", datagram, 6)[0]
-            msg_chunk_data = struct.unpack_from("!%ds" % msg_payload_len, datagram, 8)[0]
-            logging.debug("last fragment received, msg_group_index '%d', msg_chunk_size '%d' msg_fragment_size%d\n" 
-                      % (msg_group_index, msg_payload_len, msg_fragments_size))
-        else:  # middle fragments received
-            msg_payload_len = MAX_PACKET_SIZE - self.msg_group_field_size - self.msg_group_index_field_size
-            msg_chunk_data = struct.unpack_from("!%ds" % msg_chunk_size, datagram, 4)[0]
-            logging.debug("middle fragment received, msg_group_index '%d', msg_chunk_size '%d'\n" 
-                  % (msg_group_index, msg_payload_len))
-        
-         # new msg fragment received, initialize it.
-        if self.recvs.get(msg_group_id) is None: 
-            logging.debug("create a new msg with id '%d'\n" % msg_group_id) 
-            self.recvs[msg_group_id] = []
-            self.recvs[msg_group_id].append(0)  # total_fragments_size_index
-            self.recvs[msg_group_id].append([0 for x in xrange(self.max_buffered_fragments_size)])  # fragments_index
-            self.recvs[msg_group_id].append(0)  # curr_fragments_size_index
-            
-         # we extend it to hold all fragments
-        if msg_group_index > self.max_buffered_fragments_size - 1:
-            self.recvs[msg_group_id][self.fragments_index].extend([x for x in xrange(msg_group_index - self.max_buffered_fragments_size + 1)])
-            self.max_buffered_fragments_size = msg_group_index + 1
-        
-        # cache the msg_chunk_data 
-        self.recvs[msg_group_id][self.fragments_index][msg_group_index] = msg_chunk_data
-          
-        # update curr received fragments size
-        self.recvs[msg_group_id][self.curr_fragments_size_index] += 1
-        logging.debug("currently received fragments '%d', total size '%d'\n"
-               % (len(self.recvs[msg_group_id][self.curr_fragments_size_index]), self.recvs[msg_group_id][self.total_fragments_size_index]))
-        
-        # all fragments received and starts to ressembleing
-        if self.recvs[msg_group_id][self.curr_fragments_size_index] == self.recvs[msg_group_id][self.total_fragments_size_index]:
-            v = self.recvs.pop(msg_group_id)
-            fragments = v[self.fragments_index]
-            fragments_size = v[self.curr_fragments_size_index]
-            fragments_buffered = fragments[0:fragments_size]
-            msg = bytearray(0)
-            for i in fragments_buffered: msg += i
-            self.complete_user_msgs.append(bytes(msg))
-            logging.debug("Construct a complete msg.\n")
-            
 if __name__ == '__main__':
-    o = Reliabler(FakeTransport(), "fake addr")
+    t = FakeTransport()
+    o = Reliabler(t, "fake addr")
+    t.r = o
     
     d = sctp_msg()
-    d.chunk_type = CHUNK_TYPE_INIT  # CHUNK_TYPE_DATA
+    d.chunk_type =CHUNK_TYPE_DATA
     
     msgid = 123
     data = [1, 2, 3]
     bytedata = pickle.dumps(data)  # it has been encoded using asciii encodes single char encode
     
-    for i in xrange(1000):
+    for i in xrange(1):
         logging.debug("test very big msg with a new packet")
         d.stream_identifier = randint(0, 1)
         d.is_unorder_msg = randint(0, 1)
-        strbuf = ['0' for i in xrange(randint(20, 21))]
+        strbuf = [str(i) for i in xrange(randint(80, 81))]
         bigdata = ''.join(strbuf)
         msgid = 6
         d.payload_ptl_itfier = msgid 
@@ -843,7 +807,8 @@ if __name__ == '__main__':
         pack_into("!B%ds%ds" % (len(bigdata), len(bytedata)), buf, 0, msgid, bytedata, bigdata)
         d.data = buf
         o.send_msg(d)
-    
+        for datagram in o.sending_packets:
+            o.recvr(o.sending_packets[0])
     
 
 
